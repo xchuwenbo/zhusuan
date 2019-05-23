@@ -1,124 +1,107 @@
-# ZhuSuan
+<div align="center">
+  <a href="http://zhusuan.readthedocs.io"> <img width="250px" height="auto" 
+  src="docs/_static/images/zhusuan-logo-v.png"></a>
+</div>
 
-ZhuSuan is a python	library	for	**Generative Models**, built upon Tensorflow.
-Unlike existing deep learning libraries, which are mainly designed for
-supervised tasks, ZhuSuan is featured for its deep root into Bayesian
-Inference, thus supporting various kinds of generative models: both the
-traditional **hierarchical Bayesian models** and recent
-**deep generative models**.
+---
 
-With ZhuSuan, users can enjoy powerful fitting and multi-GPU training of deep
-learning, while at the same time they can use generative models to model the
-complex world, exploit unlabeled data and deal with uncertainty by performing
-principled Bayesian inference.
+[![Build Status](https://travis-ci.org/thu-ml/zhusuan.svg?branch=master)](https://travis-ci.org/thu-ml/zhusuan)
+[![Doc Status](https://readthedocs.org/projects/zhusuan/badge/?version=latest)](http://zhusuan.readthedocs.io/en/latest/?badge=latest)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/thu-ml/zhusuan/blob/master/LICENSE)
+[![Join the chat at https://gitter.im/thu-ml/zhusuan](https://badges.gitter.im/thu-ml/zhusuan.svg)](https://gitter.im/thu-ml/zhusuan?utm_source=badge&utm_medium=badge&utm_campaign=pr-badge&utm_content=badge)
 
-## Supported Inference
-### (Stochastic) Variational Inference (VI & SVI)
-* Kinds of variational posteriors we support:
-  * __Mean-field__ posterior: Fully-factorized.
-  * __Structured__ posterior: With user specified dependencies.
+**ZhuSuan** is a Python probabilistic programming library for Bayesian deep
+learning, which conjoins the complimentary advantages of Bayesian methods and
+deep learning. ZhuSuan is built upon
+[TensorFlow](https://www.tensorflow.org). Unlike existing deep
+learning libraries, which are mainly designed for deterministic neural
+networks and supervised tasks, ZhuSuan provides deep learning style primitives
+and algorithms for building probabilistic models and applying Bayesian
+inference. The supported inference algorithms include:
 
-* Variational objectives we support:
-  * __SGVB__: Stochastic gradient variational Bayes
-  * __IWAE__: Importance weighted objectives
-  * __NVIL__: Score function estimator with variance reduction
-  * __VIMCO__: Multi-sample score function estimator with variance reduction
+* **Variational Inference (VI)** with programmable variational posteriors, various
+  objectives and advanced gradient estimators (SGVB, REINFORCE, VIMCO, etc.).
 
-### Adaptive Importance Sampling
-* Reweighted Wake-sleep (__RWS__): With user specified adaptive proposal.
+* **Importance Sampling (IS)** for learning and evaluating models, with programmable
+  proposals.
 
-### Markov Chain Monte Carlo (MCMC)
-* Hamiltonian Monte Carlo (__HMC__): With step size and mass adaptation.
+* **Hamiltonian Monte Carlo (HMC)** with parallel chains, and optional
+  automatic parameter tuning.
+
+* **Stochastic Gradient Markov Chain Monte Carlo (SGMCMC)**:
+  SGLD, PSGLD, SGHMC, and SGNHT.
 
 ## Installation
 
 ZhuSuan is still under development. Before the first stable release (1.0),
 please clone the repository and run
+```
+pip install .
+```
+in the main directory. This will install ZhuSuan and its dependencies
+automatically. ZhuSuan also requires **TensorFlow 1.13.0 or later**. Because
+users should choose whether to install the cpu or gpu version of TensorFlow,
+we do not include it in the dependencies. See
+[Installing TensorFlow](https://www.tensorflow.org/install/).
 
-`pip install .`
-
-in the main directory. This will install ZhuSuan and its dependencies 
-automatically. 
-
-If you are developing ZhuSuan, you may want to install in an 
-"editable" or "develop" mode. See the Developments section below.
+If you are developing ZhuSuan, you may want to install in an
+"editable" or "develop" mode. Please refer to the Contributing section below.
 
 ## Documentation
 
-Documentation is available online: [zhusuan.readthedocs.io](http://zhusuan.readthedocs.io)
+* [Tutorials and API docs](http://zhusuan.readthedocs.io)
+* [ZhuSuan's white paper](https://arxiv.org/abs/1709.05870)
 
 ## Examples
 
+We provide examples on traditional hierarchical Bayesian models and recent
+deep generative models.
+
 To run the provided examples, you may need extra dependencies to be installed.
 This can be done by
-
-`pip install ".[examples]"`
-
+```
+pip install ".[examples]"
+```
 * Gaussian: 
-[HMC](examples/toy_examples/gaussian.py)
-* Toy 2D Intractable Posterior: 
-[SGVB](examples/toy_examples/toy2d.py)
-* Beyesian Neural Networks: 
-[SGVB](examples/bayesian_neural_nets/bayesian_nn.py)
-* Variational Autoencoder (VAE): 
-[SGVB](examples/variational_autoencoders/vae.py), 
-[IWAE](examples/variational_autoencoders/iwae.py)
-* Convolutional VAE: 
-[SGVB](examples/variational_autoencoders/vae_conv.py)
-* Semi-supervised VAE (Kingma, 2014): 
-[SGVB](examples/semi_supervised_vae/vae_ssl.py),
-[RWS](examples/semi_supervised_vae/vae_ssl_rws.py)
+  [HMC](examples/toy_examples/gaussian.py)
+* Toy 2D Intractable Posterior:
+  [SGVB](examples/toy_examples/toy2d_intractable.py)
+* Bayesian Neural Networks:
+  [SGVB](examples/bayesian_neural_nets/bnn_vi.py),
+  [SGMCMC](examples/bayesian_neural_nets/bnn_sgmcmc.py)
+* Variational Autoencoder (VAE):
+  [SGVB](examples/variational_autoencoders/vae.py),
+  [IWAE](examples/variational_autoencoders/iwae.py)
+* Convolutional VAE:
+  [SGVB](examples/variational_autoencoders/vae_conv.py)
+* Semi-supervised VAE (Kingma, 2014):
+  [SGVB](examples/semi_supervised_vae/vae_ssl.py),
+  [Adaptive IS](examples/semi_supervised_vae/vae_ssl_adaptive_is.py)
 * Deep Sigmoid Belief Networks
-[RWS](examples/sigmoid_belief_nets/sbn_rws.py),
-[VIMCO](examples/sigmoid_belief_nets/sbn_vimco.py)
-* Logistic Normal Topic Model: 
-[HMC](examples/topic_models/lntm_mcem.py)
+  [Adaptive IS](examples/sigmoid_belief_nets/sbn_adaptive_is.py),
+  [VIMCO](examples/sigmoid_belief_nets/sbn_vimco.py)
+* Logistic Normal Topic Model:
+  [HMC](examples/topic_models/lntm_mcem.py)
+* Probabilistic Matrix Factorization:
+  [HMC](examples/probabilistic_matrix_factorization/pmf_hmc.py)
+* Sparse Variational Gaussian Process:
+  [SGVB](examples/gaussian_process/svgp.py)
 
-## Developments
+## Citing ZhuSuan
 
-To install ZhuSuan in an "editable" or "develop" mode, run
+If you find ZhuSuan useful, please cite it in your publications.
+We provide a BibTeX entry of the ZhuSuan white paper below.
+```
+@ARTICLE{zhusuan2017,
+    title={Zhu{S}uan: A Library for {B}ayesian Deep Learning},
+    author={Shi, Jiaxin and Chen, Jianfei. and Zhu, Jun and Sun, Shengyang
+    and Luo, Yucen and Gu, Yihong and Zhou, Yuhao},
+    journal={arXiv preprint arXiv:1709.05870},
+    year=2017,
+}
+```
 
-`pip install -e .`
+## Contributing
 
-in the main directory. This installation is removable by
-
-`pip uninstall zhusuan`
-
-Additional dependencies for developments can be installed by
-
-`pip install ".[dev]"`
-
-### Tests
-This command will run automatic tests in the main directory.
-
-`python -m unittest discover -v`
-
-##### Test Coverage
-After running tests, to ensure test coverage over the 
-developments, run
-
-`coverage report --include="zhusuan/*"`
-
-##### PEP8 Code Style Check
-We follow PEP8 python code style. To check, in the main directory, run
-
-`pep8 .`
-
-### Docs
-
-Docs are written under `docs/` directory as RestructuredText (`.rst`) files.
-`index.rst` is the main page. A Tutorial on RestructuredText can be found 
-[here](https://pythonhosted.org/an_example_pypi_project/sphinx.html).
-
-API References are automatically generated by 
-[Sphinx](http://www.sphinx-doc.org/en/stable/). They are under `doc/api/` 
-directory and should be regenerated each time when any code changes:
-
-`make api`
-
-To compile docs into webpages, Run
-
-`make html`
-
-under `docs/` directory. The generated webpages are in `docs/_build` and
-can be viewed with browsers.
+We always welcome contributions to help make ZhuSuan better. If you would like 
+to contribute, please check out the guidelines [here](CONTRIBUTING.md).

@@ -7,15 +7,24 @@ from __future__ import division
 import numpy as np
 import tensorflow as tf
 
-from zhusuan.distributions.base import *
-from zhusuan.distributions.utils import \
-        maybe_explicit_broadcast, \
-        assert_same_float_dtype, \
-        assert_same_float_and_int_dtype
+from zhusuan.distributions.base import Distribution
+from zhusuan.distributions.utils import (
+    maybe_explicit_broadcast,
+    assert_same_dtype_in,
+    assert_same_float_dtype,
+    assert_dtype_in_dtypes,
+    assert_dtype_is_int_or_float,
+    assert_scalar,
+    assert_rank_at_least_one,
+    get_shape_at,
+    open_interval_standard_uniform,
+    ensure_logstd_std_order_change,
+)
 
 
 __all__ = [
     'Normal',
+    'FoldNormal',
     'Bernoulli',
     'Categorical',
     'Discrete',
@@ -26,6 +35,8 @@ __all__ = [
     'Binomial',
     'InverseGamma',
     'Laplace',
+    'BinConcrete',
+    'BinGumbelSoftmax',
 ]
 
 
@@ -34,11 +45,21 @@ class Normal(Distribution):
     The class of univariate Normal distribution.
     See :class:`~zhusuan.distributions.base.Distribution` for details.
 
+    .. warning::
+
+        The order of arguments `logstd`/`std` has changed to `std`/`logstd`
+        since 0.3.1. Please use named arguments: ``Normal(mean, std=..., ...)``
+        or ``Normal(mean, logstd=..., ...)``.
+
     :param mean: A `float` Tensor. The mean of the Normal distribution.
-        Should be broadcastable to match `logstd`.
+        Should be broadcastable to match `std` or `logstd`.
+    :param _sentinel: Used to prevent positional parameters. Internal,
+        do not use.
+    :param std: A `float` Tensor. The standard deviation of the Normal
+        distribution. Should be positive and broadcastable to match `mean`.
     :param logstd: A `float` Tensor. The log standard deviation of the Normal
         distribution. Should be broadcastable to match `mean`.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -47,36 +68,66 @@ class Normal(Distribution):
     :param is_reparameterized: A Bool. If True, gradients on samples from this
         distribution are allowed to propagate into inputs, using the
         reparametrization trick from (Kingma, 2013).
+    :param use_path_derivative: A bool. Whether when taking the gradients
+        of the log-probability to propagate them through the parameters
+        of the distribution (False meaning you do propagate them). This
+        is based on the paper "Sticking the Landing: Simple,
+        Lower-Variance Gradient Estimators for Variational Inference"
     :param check_numerics: Bool. Whether to check numeric issues.
     """
 
     def __init__(self,
                  mean=0.,
-                 logstd=0.,
-                 group_event_ndims=0,
+                 _sentinel=None,
+                 std=None,
+                 logstd=None,
+                 group_ndims=0,
                  is_reparameterized=True,
-                 check_numerics=False):
+                 use_path_derivative=False,
+                 check_numerics=False,
+                 **kwargs):
+        ensure_logstd_std_order_change("Normal", _sentinel)
         self._mean = tf.convert_to_tensor(mean)
-        self._logstd = tf.convert_to_tensor(logstd)
-        dtype = assert_same_float_dtype(
-            [(self._mean, 'Normal.mean'),
-             (self._logstd, 'Normal.logstd')])
+
+        if (logstd is None) == (std is None):
+            raise ValueError(
+                "Either `std` or `logstd` should be passed. It is not allowed "
+                "that both are specified or both are not.")
+        elif logstd is None:
+            self._std = tf.convert_to_tensor(std)
+            dtype = assert_same_float_dtype([(self._mean, 'Normal.mean'),
+                                             (self._std, 'Normal.std')])
+            logstd = tf.log(self._std)
+            if check_numerics:
+                logstd = tf.check_numerics(logstd, "log(std)")
+            self._logstd = logstd
+        else:
+            # std is None
+            self._logstd = tf.convert_to_tensor(logstd)
+            dtype = assert_same_float_dtype([(self._mean, 'Normal.mean'),
+                                             (self._logstd, 'Normal.logstd')])
+            std = tf.exp(self._logstd)
+            if check_numerics:
+                std = tf.check_numerics(std, "exp(logstd)")
+            self._std = std
 
         try:
             tf.broadcast_static_shape(self._mean.get_shape(),
-                                      self._logstd.get_shape())
+                                      self._std.get_shape())
         except ValueError:
             raise ValueError(
-                "mean and logstd should be broadcastable to match each "
+                "mean and std/logstd should be broadcastable to match each "
                 "other. ({} vs. {})".format(
-                    self._mean.get_shape(), self._logstd.get_shape()))
+                    self._mean.get_shape(), self._std.get_shape()))
         self._check_numerics = check_numerics
         super(Normal, self).__init__(
             dtype=dtype,
             param_dtype=dtype,
             is_continuous=True,
             is_reparameterized=is_reparameterized,
-            group_event_ndims=group_event_ndims)
+            use_path_derivative=use_path_derivative,
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def mean(self):
@@ -88,6 +139,11 @@ class Normal(Distribution):
         """The log standard deviation of the Normal distribution."""
         return self._logstd
 
+    @property
+    def std(self):
+        """The standard deviation of the Normal distribution."""
+        return self._std
+
     def _value_shape(self):
         return tf.constant([], dtype=tf.int32)
 
@@ -96,20 +152,19 @@ class Normal(Distribution):
 
     def _batch_shape(self):
         return tf.broadcast_dynamic_shape(tf.shape(self.mean),
-                                          tf.shape(self.logstd))
+                                          tf.shape(self.std))
 
     def _get_batch_shape(self):
         return tf.broadcast_static_shape(self.mean.get_shape(),
-                                         self.logstd.get_shape())
+                                         self.std.get_shape())
 
     def _sample(self, n_samples):
-        mean, logstd = self.mean, self.logstd
+        mean, std = self.mean, self.std
         if not self.is_reparameterized:
             mean = tf.stop_gradient(mean)
-            logstd = tf.stop_gradient(logstd)
+            std = tf.stop_gradient(std)
         shape = tf.concat([[n_samples], self.batch_shape], 0)
-        samples = tf.random_normal(shape, dtype=self.dtype) * \
-            tf.exp(logstd) + mean
+        samples = tf.random_normal(shape, dtype=self.dtype) * std + mean
         static_n_samples = n_samples if isinstance(n_samples, int) else None
         samples.set_shape(
             tf.TensorShape([static_n_samples]).concatenate(
@@ -117,13 +172,160 @@ class Normal(Distribution):
         return samples
 
     def _log_prob(self, given):
+        mean, logstd = self.path_param(self.mean),\
+                       self.path_param(self.logstd)
         c = -0.5 * np.log(2 * np.pi)
-        precision = tf.exp(-2 * self.logstd)
+        precision = tf.exp(-2 * logstd)
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(precision, "precision")]):
-                precision = tf.identity(precision)
-        return c - self.logstd - 0.5 * precision * tf.square(given - self.mean)
+            precision = tf.check_numerics(precision, "precision")
+        return c - logstd - 0.5 * precision * tf.square(given - mean)
+
+    def _prob(self, given):
+        return tf.exp(self._log_prob(given))
+
+
+class FoldNormal(Distribution):
+    """
+    The class of univariate FoldNormal distribution.
+    See :class:`~zhusuan.distributions.base.Distribution` for details.
+
+    .. warning::
+
+        The order of arguments `logstd`/`std` has changed to `std`/`logstd`
+        since 0.3.1. Please use named arguments:
+        ``FoldNormal(mean, std=..., ...)`` or
+        ``FoldNormal(mean, logstd=..., ...)``.
+
+    :param mean: A `float` Tensor. The mean of the FoldNormal distribution.
+        Should be broadcastable to match `std` or `logstd`.
+    :param _sentinel: Used to prevent positional parameters. Internal,
+        do not use.
+    :param std: A `float` Tensor. The standard deviation of the FoldNormal
+        distribution. Should be positive and broadcastable to match `mean`.
+    :param logstd: A `float` Tensor. The log standard deviation of the
+        FoldNormal distribution. Should be broadcastable to match `mean`.
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
+        dimensions in `batch_shape` (counted from the end) that are grouped
+        into a single event, so that their probabilities are calculated
+        together. Default is 0, which means a single value is an event.
+        See :class:`~zhusuan.distributions.base.Distribution` for more detailed
+        explanation.
+    :param is_reparameterized: A Bool. If True, gradients on samples from this
+        distribution are allowed to propagate into inputs, using the
+        reparametrization trick from (Kingma, 2013).
+    :param use_path_derivative: A bool. Whether when taking the gradients
+        of the log-probability to propagate them through the parameters
+        of the distribution (False meaning you do propagate them). This
+        is based on the paper "Sticking the Landing: Simple,
+        Lower-Variance Gradient Estimators for Variational Inference"
+    :param check_numerics: Bool. Whether to check numeric issues.
+    """
+
+    def __init__(self,
+                 mean=0.,
+                 _sentinel=None,
+                 std=None,
+                 logstd=None,
+                 group_ndims=0,
+                 is_reparameterized=True,
+                 use_path_derivative=False,
+                 check_numerics=False,
+                 **kwargs):
+        ensure_logstd_std_order_change("FoldNormal", _sentinel)
+        self._mean = tf.convert_to_tensor(mean)
+
+        if (logstd is None) == (std is None):
+            raise ValueError("Either std or logstd should be passed but not "
+                             "both of them.")
+        elif logstd is None:
+            self._std = tf.convert_to_tensor(std)
+            dtype = assert_same_float_dtype([(self._mean, 'FoldNormal.mean'),
+                                             (self._std, 'FoldNormal.std')])
+            logstd = tf.log(self._std)
+            if check_numerics:
+                logstd = tf.check_numerics(logstd, "log(std)")
+            self._logstd = logstd
+        else:
+            # std is None
+            self._logstd = tf.convert_to_tensor(logstd)
+            dtype = assert_same_float_dtype(
+                [(self._mean, 'FoldNormal.mean'),
+                 (self._logstd, 'FoldNormal.logstd')])
+            std = tf.exp(self._logstd)
+            if check_numerics:
+                std = tf.check_numerics(std, "exp(logstd)")
+            self._std = std
+
+        try:
+            tf.broadcast_static_shape(self._mean.get_shape(),
+                                      self._std.get_shape())
+        except ValueError:
+            raise ValueError(
+                "mean and std/logstd should be broadcastable to match each "
+                "other. ({} vs. {})".format(
+                    self._mean.get_shape(), self._std.get_shape()))
+        self._check_numerics = check_numerics
+        super(FoldNormal, self).__init__(
+            dtype=dtype,
+            param_dtype=dtype,
+            is_continuous=True,
+            is_reparameterized=is_reparameterized,
+            use_path_derivative=use_path_derivative,
+            group_ndims=group_ndims,
+            **kwargs)
+
+    @property
+    def mean(self):
+        """The mean of the FoldNormal distribution."""
+        return self._mean
+
+    @property
+    def logstd(self):
+        """The log standard deviation of the FoldNormal distribution."""
+        return self._logstd
+
+    @property
+    def std(self):
+        """The standard deviation of the FoldNormal distribution."""
+        return self._std
+
+    def _value_shape(self):
+        return tf.constant([], dtype=tf.int32)
+
+    def _get_value_shape(self):
+        return tf.TensorShape([])
+
+    def _batch_shape(self):
+        return tf.broadcast_dynamic_shape(tf.shape(self.mean),
+                                          tf.shape(self.std))
+
+    def _get_batch_shape(self):
+        return tf.broadcast_static_shape(self.mean.get_shape(),
+                                         self.std.get_shape())
+
+    def _sample(self, n_samples):
+        mean, std = self.mean, self.std
+        if not self.is_reparameterized:
+            mean = tf.stop_gradient(mean)
+            std = tf.stop_gradient(std)
+        shape = tf.concat([[n_samples], self.batch_shape], 0)
+        samples = tf.random_normal(shape, dtype=self.dtype) * std + mean
+        static_n_samples = n_samples if isinstance(n_samples, int) else None
+        samples.set_shape(
+            tf.TensorShape([static_n_samples]).concatenate(
+                self.get_batch_shape()))
+        return samples
+
+    def _log_prob(self, given):
+        mean, logstd = self.path_param(self.mean), \
+                       self.path_param(self.logstd)
+        c = -0.5 * (np.log(2.0) + np.log(np.pi))
+        precision = tf.exp(-2.0 * logstd)
+        if self._check_numerics:
+            precision = tf.check_numerics(precision, "precision")
+        mask = tf.log(tf.cast(given >= 0., dtype=precision.dtype))
+        return (c - (logstd + 0.5 * precision * tf.square(given - mean)) +
+                tf.nn.softplus(-2.0 * mean * given * precision)) + mask
 
     def _prob(self, given):
         return tf.exp(self._log_prob(given))
@@ -138,8 +340,10 @@ class Bernoulli(Distribution):
 
         .. math:: \\mathrm{logits} = \\log \\frac{p}{1 - p}
 
-    :param dtype: The value type of samples from the distribution.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param dtype: The value type of samples from the distribution. Can be
+        int (`tf.int16`, `tf.int32`, `tf.int64`) or float (`tf.float16`,
+        `tf.float32`, `tf.float64`). Default is `int32`.
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -147,21 +351,20 @@ class Bernoulli(Distribution):
         explanation.
     """
 
-    def __init__(self, logits, dtype=None, group_event_ndims=0):
+    def __init__(self, logits, dtype=tf.int32, group_ndims=0, **kwargs):
         self._logits = tf.convert_to_tensor(logits)
         param_dtype = assert_same_float_dtype(
             [(self._logits, 'Bernoulli.logits')])
 
-        if dtype is None:
-            dtype = tf.int32
-        assert_same_float_and_int_dtype([], dtype)
+        assert_dtype_is_int_or_float(dtype)
 
         super(Bernoulli, self).__init__(
             dtype=dtype,
             param_dtype=param_dtype,
             is_continuous=False,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def logits(self):
@@ -208,14 +411,15 @@ class Categorical(Distribution):
     The class of univariate Categorical distribution.
     See :class:`~zhusuan.distributions.base.Distribution` for details.
 
-    :param logits: A N-D (N >= 1) `float` Tensor of shape (...,
+    :param logits: A N-D (N >= 1) `float32` or `float64` Tensor of shape (...,
         n_categories). Each slice `[i, j,..., k, :]` represents the
         un-normalized log probabilities for all categories.
 
         .. math:: \\mathrm{logits} \\propto \\log p
 
-    :param dtype: The value type of samples from the distribution.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param dtype: The value type of samples from the distribution. Can be
+        `float32`, `float64`, `int32`, or `int64`. Default is `int32`.
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -226,35 +430,26 @@ class Categorical(Distribution):
     [0, n_categories).
     """
 
-    def __init__(self, logits, dtype=None, group_event_ndims=0):
+    def __init__(self, logits, dtype=tf.int32, group_ndims=0, **kwargs):
         self._logits = tf.convert_to_tensor(logits)
-        param_dtype = assert_same_float_dtype(
-            [(self._logits, 'Categorical.logits')])
+        param_dtype = assert_same_dtype_in(
+            [(self._logits, 'Categorical.logits')],
+            [tf.float32, tf.float64])
 
-        if dtype is None:
-            dtype = tf.int32
-        assert_same_float_and_int_dtype([], dtype)
+        allowed_dtypes = [tf.float32, tf.float64, tf.int32, tf.int64]
+        assert_dtype_in_dtypes(dtype, allowed_dtypes)
 
-        static_logits_shape = self._logits.get_shape()
-        shape_err_msg = "logits should have rank >= 1."
-        if static_logits_shape and (static_logits_shape.ndims < 1):
-            raise ValueError(shape_err_msg)
-        elif static_logits_shape and (
-                static_logits_shape[-1].value is not None):
-            self._n_categories = static_logits_shape[-1].value
-        else:
-            _assert_shape_op = tf.assert_rank_at_least(
-                self._logits, 1, message=shape_err_msg)
-            with tf.control_dependencies([_assert_shape_op]):
-                self._logits = tf.identity(self._logits)
-            self._n_categories = tf.shape(self._logits)[-1]
+        self._logits = assert_rank_at_least_one(
+                self._logits, 'Categorical.logits')
+        self._n_categories = get_shape_at(self._logits, -1)
 
         super(Categorical, self).__init__(
             dtype=dtype,
             param_dtype=param_dtype,
             is_continuous=False,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def logits(self):
@@ -285,11 +480,13 @@ class Categorical(Distribution):
             logits_flat = self.logits
         else:
             logits_flat = tf.reshape(self.logits, [-1, self.n_categories])
-        samples_flat = tf.transpose(tf.multinomial(logits_flat, n_samples))
+        samples_flat = tf.transpose(
+            tf.random.categorical(logits_flat, n_samples))
+        samples_flat = tf.cast(samples_flat, self.dtype)
         if self.logits.get_shape().ndims == 2:
             return samples_flat
         shape = tf.concat([[n_samples], self.batch_shape], 0)
-        samples = tf.cast(tf.reshape(samples_flat, shape), self.dtype)
+        samples = tf.reshape(samples_flat, shape)
         static_n_samples = n_samples if isinstance(n_samples, int) else None
         samples.set_shape(
             tf.TensorShape([static_n_samples]).concatenate(
@@ -308,13 +505,13 @@ class Categorical(Distribution):
             logits *= tf.ones_like(tf.expand_dims(given, -1), self.param_dtype)
             return given, logits
 
-        def _is_same_dynamic_shape(given, logits):
-            return tf.cond(
-                tf.equal(tf.rank(given), tf.rank(logits) - 1),
-                lambda: tf.reduce_all(tf.equal(
-                    tf.concat([tf.shape(given), tf.shape(logits)[:-1]], 0),
-                    tf.concat([tf.shape(logits)[:-1], tf.shape(given)], 0))),
-                lambda: tf.convert_to_tensor(False, tf.bool))
+        # def _is_same_dynamic_shape(given, logits):
+        #     return tf.cond(
+        #         tf.equal(tf.rank(given), tf.rank(logits) - 1),
+        #         lambda: tf.reduce_all(tf.equal(
+        #             tf.concat([tf.shape(given), tf.shape(logits)[:-1]], 0),
+        #             tf.concat([tf.shape(logits)[:-1], tf.shape(given)], 0))),
+        #         lambda: tf.convert_to_tensor(False, tf.bool))
 
         if not (given.get_shape() and logits.get_shape()):
             given, logits = _broadcast(given, logits)
@@ -340,11 +537,9 @@ class Categorical(Distribution):
         # `labels` type of `sparse_softmax_cross_entropy_with_logits` must be
         # int32 or int64
         if self.dtype == tf.float32:
-            given = tf.cast(given, dtype=tf.int32)
-        elif self.dtype == tf.float64:
-            given = tf.cast(given, dtype=tf.int64)
-        elif self.dtype not in [tf.int32, tf.int64]:
             given = tf.cast(given, tf.int32)
+        elif self.dtype == tf.float64:
+            given = tf.cast(given, tf.int64)
         log_p = -tf.nn.sparse_softmax_cross_entropy_with_logits(labels=given,
                                                                 logits=logits)
         if given.get_shape() and logits.get_shape():
@@ -368,7 +563,7 @@ class Uniform(Distribution):
         uniform distribution. Should be broadcastable to match `maxval`.
     :param maxval: A `float` Tensor. The upper bound on the range of the
         uniform distribution. Should be element-wise bigger than `minval`.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -383,9 +578,10 @@ class Uniform(Distribution):
     def __init__(self,
                  minval=0.,
                  maxval=1.,
-                 group_event_ndims=0,
+                 group_ndims=0,
                  is_reparameterized=True,
-                 check_numerics=False):
+                 check_numerics=False,
+                 **kwargs):
         self._minval = tf.convert_to_tensor(minval)
         self._maxval = tf.convert_to_tensor(maxval)
         dtype = assert_same_float_dtype(
@@ -406,7 +602,8 @@ class Uniform(Distribution):
             param_dtype=dtype,
             is_continuous=True,
             is_reparameterized=is_reparameterized,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def minval(self):
@@ -449,9 +646,7 @@ class Uniform(Distribution):
     def _log_prob(self, given):
         log_p = tf.log(self._prob(given))
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(log_p, message="log_p")]):
-                log_p = tf.identity(log_p)
+            log_p = tf.check_numerics(log_p, "log_p")
         return log_p
 
     def _prob(self, given):
@@ -460,9 +655,7 @@ class Uniform(Distribution):
                        self.dtype)
         p = 1. / (self.maxval - self.minval)
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(p, message="p")]):
-                p = tf.identity(p)
+            p = tf.check_numerics(p, "p")
         return p * mask
 
 
@@ -475,7 +668,7 @@ class Gamma(Distribution):
         distribution. Should be positive and broadcastable to match `beta`.
     :param beta: A `float` Tensor. The inverse scale parameter of the Gamma
         distribution. Should be positive and broadcastable to match `alpha`.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -487,8 +680,9 @@ class Gamma(Distribution):
     def __init__(self,
                  alpha,
                  beta,
-                 group_event_ndims=0,
-                 check_numerics=False):
+                 group_ndims=0,
+                 check_numerics=False,
+                 **kwargs):
         self._alpha = tf.convert_to_tensor(alpha)
         self._beta = tf.convert_to_tensor(beta)
         dtype = assert_same_float_dtype(
@@ -509,7 +703,8 @@ class Gamma(Distribution):
             param_dtype=dtype,
             is_continuous=True,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def alpha(self):
@@ -542,15 +737,12 @@ class Gamma(Distribution):
     def _log_prob(self, given):
         alpha, beta = self.alpha, self.beta
         log_given = tf.log(given)
-        log_alpha, log_beta = tf.log(alpha), tf.log(beta)
+        log_beta = tf.log(beta)
         lgamma_alpha = tf.lgamma(alpha)
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(log_given, "log(given)"),
-                     tf.check_numerics(log_alpha, "log(alpha)"),
-                     tf.check_numerics(log_beta, "log(beta)"),
-                     tf.check_numerics(lgamma_alpha, "lgamma(alpha)")]):
-                log_given = tf.identity(log_given)
+            log_given = tf.check_numerics(log_given, "log(given)")
+            log_beta = tf.check_numerics(log_beta, "log(beta)")
+            lgamma_alpha = tf.check_numerics(lgamma_alpha, "lgamma(alpha)")
         return alpha * log_beta - lgamma_alpha + (alpha - 1) * log_given - \
             beta * given
 
@@ -569,7 +761,7 @@ class Beta(Distribution):
     :param beta: A `float` Tensor. One of the two shape parameters of the
         Beta distribution. Should be positive and broadcastable to match
         `alpha`.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -581,9 +773,9 @@ class Beta(Distribution):
     def __init__(self,
                  alpha,
                  beta,
-                 dtype=None,
-                 group_event_ndims=0,
-                 check_numerics=False):
+                 group_ndims=0,
+                 check_numerics=False,
+                 **kwargs):
         self._alpha = tf.convert_to_tensor(alpha)
         self._beta = tf.convert_to_tensor(beta)
         dtype = assert_same_float_dtype(
@@ -604,7 +796,8 @@ class Beta(Distribution):
             param_dtype=dtype,
             is_continuous=True,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def alpha(self):
@@ -644,15 +837,16 @@ class Beta(Distribution):
         log_1_minus_given = tf.log(1 - given)
         lgamma_alpha, lgamma_beta = tf.lgamma(alpha), tf.lgamma(beta)
         lgamma_alpha_plus_beta = tf.lgamma(alpha + beta)
+
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(log_given, "log(given)"),
-                     tf.check_numerics(log_1_minus_given, "log(1 - given)"),
-                     tf.check_numerics(lgamma_alpha, "lgamma(alpha)"),
-                     tf.check_numerics(lgamma_beta, "lgamma(beta)"),
-                     tf.check_numerics(lgamma_alpha_plus_beta,
-                                       "lgamma(alpha + beta)")]):
-                log_given = tf.identity(log_given)
+            log_given = tf.check_numerics(log_given, "log(given)")
+            log_1_minus_given = tf.check_numerics(
+                log_1_minus_given, "log(1 - given)")
+            lgamma_alpha = tf.check_numerics(lgamma_alpha, "lgamma(alpha)")
+            lgamma_beta = tf.check_numerics(lgamma_beta, "lgamma(beta)")
+            lgamma_alpha_plus_beta = tf.check_numerics(
+                lgamma_alpha_plus_beta, "lgamma(alpha + beta)")
+
         return (alpha - 1) * log_given + (beta - 1) * log_1_minus_given - (
             lgamma_alpha + lgamma_beta - lgamma_alpha_plus_beta)
 
@@ -667,8 +861,10 @@ class Poisson(Distribution):
 
     :param rate: A `float` Tensor. The rate parameter of Poisson
         distribution. Must be positive.
-    :param dtype: The value type of samples from the distribution.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param dtype: The value type of samples from the distribution. Can be
+        int (`tf.int16`, `tf.int32`, `tf.int64`) or float (`tf.float16`,
+        `tf.float32`, `tf.float64`). Default is `int32`.
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -679,16 +875,15 @@ class Poisson(Distribution):
 
     def __init__(self,
                  rate,
-                 dtype=None,
-                 group_event_ndims=0,
-                 check_numerics=False):
+                 dtype=tf.int32,
+                 group_ndims=0,
+                 check_numerics=False,
+                 **kwargs):
         self._rate = tf.convert_to_tensor(rate)
         param_dtype = assert_same_float_dtype(
             [(self._rate, 'Poisson.rate')])
 
-        if dtype is None:
-            dtype = tf.int32
-        assert_same_float_and_int_dtype([], dtype)
+        assert_dtype_is_int_or_float(dtype)
 
         self._check_numerics = check_numerics
 
@@ -697,7 +892,8 @@ class Poisson(Distribution):
             param_dtype=param_dtype,
             is_continuous=False,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def rate(self):
@@ -717,32 +913,10 @@ class Poisson(Distribution):
         return self.rate.get_shape()
 
     def _sample(self, n_samples):
-        # This algorithm to generate random Poisson-distributed numbers is
-        # given by Kunth [1]
-        # [1]: https://en.wikipedia.org/wiki/
-        #      Poisson_distribution#Generating_Poisson-distributed_random_variables
-        shape = tf.concat([[n_samples], self.batch_shape], 0)
-        static_n_samples = n_samples if isinstance(n_samples, int) else None
-        static_shape = tf.TensorShape([static_n_samples]).concatenate(
-            self.get_batch_shape())
-
-        enlam = tf.exp(-self.rate)
-        x = tf.zeros(shape, dtype=self.dtype)
-        prod = tf.ones(shape, dtype=self.param_dtype)
-
-        def loop_cond(prod, x):
-            return tf.reduce_any(tf.greater_equal(prod, enlam))
-
-        def loop_body(prod, x):
-            prod *= tf.random_uniform(tf.shape(prod), minval=0, maxval=1)
-            x += tf.cast(tf.greater_equal(prod, enlam), dtype=self.dtype)
-            return prod, x
-
-        _, samples = tf.while_loop(
-            loop_cond, loop_body, loop_vars=[prod, x],
-            shape_invariants=[static_shape, static_shape])
-
-        samples.set_shape(static_shape)
+        samples = tf.random_poisson(self.rate, [n_samples],
+                                    dtype=self.param_dtype)
+        if self.param_dtype != self.dtype:
+            samples = tf.cast(samples, self.dtype)
         return samples
 
     def _log_prob(self, given):
@@ -753,11 +927,9 @@ class Poisson(Distribution):
         lgamma_given_plus_1 = tf.lgamma(given + 1)
 
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(log_rate, "log(rate)"),
-                     tf.check_numerics(lgamma_given_plus_1,
-                                       "lgamma(given + 1)")]):
-                log_rate = tf.identity(log_rate)
+            log_rate = tf.check_numerics(log_rate, "log(rate)")
+            lgamma_given_plus_1 = tf.check_numerics(
+                lgamma_given_plus_1, "lgamma(given + 1)")
         return given * log_rate - rate - lgamma_given_plus_1
 
     def _prob(self, given):
@@ -775,8 +947,10 @@ class Binomial(Distribution):
 
     :param n_experiments: A 0-D `int32` Tensor. The number of experiments
         for each sample.
-    :param dtype: The value type of samples from the distribution.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param dtype: The value type of samples from the distribution. Can be
+        int (`tf.int16`, `tf.int32`, `tf.int64`) or float (`tf.float16`,
+        `tf.float32`, `tf.float64`). Default is `int32`.
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -788,16 +962,15 @@ class Binomial(Distribution):
     def __init__(self,
                  logits,
                  n_experiments,
-                 dtype=None,
-                 group_event_ndims=0,
-                 check_numerics=False):
+                 dtype=tf.int32,
+                 group_ndims=0,
+                 check_numerics=False,
+                 **kwargs):
         self._logits = tf.convert_to_tensor(logits)
         param_dtype = assert_same_float_dtype(
             [(self._logits, 'Binomial.logits')])
 
-        if dtype is None:
-            dtype = tf.int32
-        assert_same_float_and_int_dtype([], dtype)
+        assert_dtype_is_int_or_float(dtype)
 
         sign_err_msg = "n_experiments must be positive"
         if isinstance(n_experiments, int):
@@ -824,7 +997,8 @@ class Binomial(Distribution):
             param_dtype=param_dtype,
             is_continuous=False,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def n_experiments(self):
@@ -858,7 +1032,7 @@ class Binomial(Distribution):
         log_p = logits_flat + log_1_minus_p
         stacked_logits_flat = tf.stack([log_1_minus_p, log_p], axis=-1)
         samples_flat = tf.transpose(
-            tf.multinomial(stacked_logits_flat, n_samples * n))
+            tf.random.categorical(stacked_logits_flat, n_samples * n))
 
         shape = tf.concat([[n, n_samples], self.batch_shape], 0)
         samples = tf.reduce_sum(tf.reshape(samples_flat, shape), axis=0)
@@ -881,12 +1055,10 @@ class Binomial(Distribution):
         lgamma_n_minus_given_plus_1 = tf.lgamma(n - given + 1)
 
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(lgamma_given_plus_1,
-                                       "lgamma(given + 1)"),
-                     tf.check_numerics(lgamma_n_minus_given_plus_1,
-                                       "lgamma(n - given + 1)")]):
-                lgamma_given_plus_1 = tf.identity(lgamma_given_plus_1)
+            lgamma_given_plus_1 = tf.check_numerics(
+                lgamma_given_plus_1, "lgamma(given + 1)")
+            lgamma_n_minus_given_plus_1 = tf.check_numerics(
+                lgamma_n_minus_given_plus_1, "lgamma(n - given + 1)")
 
         return lgamma_n_plus_1 - lgamma_n_minus_given_plus_1 - \
             lgamma_given_plus_1 + given * logits + n * log_1_minus_p
@@ -904,7 +1076,7 @@ class InverseGamma(Distribution):
         distribution. Should be positive and broadcastable to match `beta`.
     :param beta: A `float` Tensor. The scale parameter of the InverseGamma
         distribution. Should be positive and broadcastable to match `alpha`.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -916,8 +1088,9 @@ class InverseGamma(Distribution):
     def __init__(self,
                  alpha,
                  beta,
-                 group_event_ndims=0,
-                 check_numerics=False):
+                 group_ndims=0,
+                 check_numerics=False,
+                 **kwargs):
         self._alpha = tf.convert_to_tensor(alpha)
         self._beta = tf.convert_to_tensor(beta)
         dtype = assert_same_float_dtype(
@@ -938,7 +1111,8 @@ class InverseGamma(Distribution):
             param_dtype=dtype,
             is_continuous=True,
             is_reparameterized=False,
-            group_event_ndims=group_event_ndims)
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def alpha(self):
@@ -972,15 +1146,14 @@ class InverseGamma(Distribution):
     def _log_prob(self, given):
         alpha, beta = self.alpha, self.beta
         log_given = tf.log(given)
-        log_alpha, log_beta = tf.log(alpha), tf.log(beta)
+        log_beta = tf.log(beta)
         lgamma_alpha = tf.lgamma(alpha)
+
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(log_given, "log(given)"),
-                     tf.check_numerics(log_alpha, "log(alpha)"),
-                     tf.check_numerics(log_beta, "log(beta)"),
-                     tf.check_numerics(lgamma_alpha, "lgamma(alpha)")]):
-                log_given = tf.identity(log_given)
+            log_given = tf.check_numerics(log_given, "log(given)")
+            log_beta = tf.check_numerics(log_beta, "log(beta)")
+            lgamma_alpha = tf.check_numerics(lgamma_alpha, "lgamma(alpha)")
+
         return alpha * log_beta - lgamma_alpha - (alpha + 1) * log_given - \
             beta / given
 
@@ -997,7 +1170,7 @@ class Laplace(Distribution):
         distribution. Should be broadcastable to match `scale`.
     :param scale: A `float` Tensor. The scale parameter of the Laplace
         distribution. Should be positive and broadcastable to match `loc`.
-    :param group_event_ndims: A 0-D `int32` Tensor representing the number of
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
         dimensions in `batch_shape` (counted from the end) that are grouped
         into a single event, so that their probabilities are calculated
         together. Default is 0, which means a single value is an event.
@@ -1006,15 +1179,22 @@ class Laplace(Distribution):
     :param is_reparameterized: A Bool. If True, gradients on samples from this
         distribution are allowed to propagate into inputs, using the
         reparametrization trick from (Kingma, 2013).
+    :param use_path_derivative: A bool. Whether when taking the gradients
+        of the log-probability to propagate them through the parameters
+        of the distribution (False meaning you do propagate them). This
+        is based on the paper "Sticking the Landing: Simple,
+        Lower-Variance Gradient Estimators for Variational Inference"
     :param check_numerics: Bool. Whether to check numeric issues.
     """
 
     def __init__(self,
                  loc,
                  scale,
-                 group_event_ndims=0,
+                 group_ndims=0,
                  is_reparameterized=True,
-                 check_numerics=False):
+                 use_path_derivative=False,
+                 check_numerics=False,
+                 **kwargs):
         self._loc = tf.convert_to_tensor(loc)
         self._scale = tf.convert_to_tensor(scale)
         dtype = assert_same_float_dtype(
@@ -1035,7 +1215,9 @@ class Laplace(Distribution):
             param_dtype=dtype,
             is_continuous=True,
             is_reparameterized=is_reparameterized,
-            group_event_ndims=group_event_ndims)
+            use_path_derivative=use_path_derivative,
+            group_ndims=group_ndims,
+            **kwargs)
 
     @property
     def loc(self):
@@ -1083,12 +1265,141 @@ class Laplace(Distribution):
         return samples
 
     def _log_prob(self, given):
-        log_scale = tf.log(self.scale)
+        loc, scale = self.path_param(self.loc),\
+                     self.path_param(self.scale)
+        log_scale = tf.log(scale)
         if self._check_numerics:
-            with tf.control_dependencies(
-                    [tf.check_numerics(log_scale, "log(scale)")]):
-                log_scale = tf.identity(log_scale)
-        return -np.log(2.) - log_scale - tf.abs(given - self.loc) / self.scale
+            log_scale = tf.check_numerics(log_scale, "log(scale)")
+        return -np.log(2.) - log_scale - tf.abs(given - loc) / scale
 
     def _prob(self, given):
         return tf.exp(self._log_prob(given))
+
+
+class BinConcrete(Distribution):
+    """
+    The class of univariate BinConcrete distribution from (Maddison, 2016).
+    It is the binary case of
+    :class:`~zhusuan.distributions.multivariate.Concrete`.
+    See :class:`~zhusuan.distributions.base.Distribution` for details.
+
+    .. seealso::
+
+        :class:`~zhusuan.distributions.multivariate.Concrete` and
+        :class:`~zhusuan.distributions.multivariate.ExpConcrete`
+
+    :param temperature: A 0-D `float` Tensor. The temperature of the relaxed
+        distribution. The temperature should be positive.
+    :param logits: A `float` Tensor. The log-odds of probabilities of being 1.
+
+        .. math:: \\mathrm{logits} = \\log \\frac{p}{1 - p}
+
+    :param group_ndims: A 0-D `int32` Tensor representing the number of
+        dimensions in `batch_shape` (counted from the end) that are grouped
+        into a single event, so that their probabilities are calculated
+        together. Default is 0, which means a single value is an event.
+        See :class:`~zhusuan.distributions.base.Distribution` for more detailed
+        explanation.
+    :param is_reparameterized: A Bool. If True, gradients on samples from this
+        distribution are allowed to propagate into inputs, using the
+        reparametrization trick from (Kingma, 2013).
+    :param use_path_derivative: A bool. Whether when taking the gradients
+        of the log-probability to propagate them through the parameters
+        of the distribution (False meaning you do propagate them). This
+        is based on the paper "Sticking the Landing: Simple,
+        Lower-Variance Gradient Estimators for Variational Inference"
+    :param check_numerics: Bool. Whether to check numeric issues.
+    """
+
+    def __init__(self,
+                 temperature,
+                 logits,
+                 group_ndims=0,
+                 is_reparameterized=True,
+                 use_path_derivative=False,
+                 check_numerics=False,
+                 **kwargs):
+        self._logits = tf.convert_to_tensor(logits)
+        self._temperature = tf.convert_to_tensor(temperature)
+        param_dtype = assert_same_float_dtype(
+            [(self._logits, 'BinConcrete.logits'),
+             (self._temperature, 'BinConcrete.temperature')])
+
+        self._temperature = assert_scalar(
+            self._temperature, 'BinConcrete.temperature')
+
+        self._check_numerics = check_numerics
+        super(BinConcrete, self).__init__(
+            dtype=param_dtype,
+            param_dtype=param_dtype,
+            is_continuous=True,
+            is_reparameterized=is_reparameterized,
+            use_path_derivative=use_path_derivative,
+            group_ndims=group_ndims,
+            **kwargs)
+
+    @property
+    def temperature(self):
+        """The temperature of BinConcrete."""
+        return self._temperature
+
+    @property
+    def logits(self):
+        """The log-odds of probabilities."""
+        return self._logits
+
+    def _value_shape(self):
+        return tf.constant([], dtype=tf.int32)
+
+    def _get_value_shape(self):
+        return tf.TensorShape([])
+
+    def _batch_shape(self):
+        return tf.shape(self.logits)
+
+    def _get_batch_shape(self):
+        return self.logits.get_shape()
+
+    def _sample(self, n_samples):
+        logits, temperature = self.logits, self.temperature
+        if not self.is_reparameterized:
+            logits = tf.stop_gradient(logits)
+            temperature = tf.stop_gradient(temperature)
+        shape = tf.concat([[n_samples], self.batch_shape], 0)
+
+        uniform = open_interval_standard_uniform(shape, self.dtype)
+        # TODO: add Logistic distribution
+        logistic = tf.log(uniform) - tf.log(1 - uniform)
+        samples = tf.sigmoid((logits + logistic) / temperature)
+
+        static_n_samples = n_samples if isinstance(n_samples, int) else None
+        samples.set_shape(
+            tf.TensorShape([static_n_samples]).concatenate(
+                self.get_batch_shape()))
+        return samples
+
+    def _log_prob(self, given):
+        temperature, logits = self.path_param(self.temperature), \
+                              self.path_param(self.logits)
+        log_given = tf.log(given)
+        log_1_minus_given = tf.log(1 - given)
+        log_temperature = tf.log(temperature)
+
+        if self._check_numerics:
+            log_given = tf.check_numerics(log_given, "log(given)")
+            log_1_minus_given = tf.check_numerics(
+                log_1_minus_given, "log(1 - given)")
+            log_temperature = tf.check_numerics(
+                log_temperature, "log(temperature)")
+
+        logistic_given = log_given - log_1_minus_given
+        temp = temperature * logistic_given - logits
+
+        return log_temperature - log_given - log_1_minus_given + \
+            temp - 2 * tf.nn.softplus(temp)
+
+    def _prob(self, given):
+        return tf.exp(self._log_prob(given))
+
+
+BinGumbelSoftmax = BinConcrete

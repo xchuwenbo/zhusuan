@@ -1,2 +1,2 @@
-tensorflow
-sphinxcontrib-bibtex
+sphinxcontrib-bibtex>=0.3.6
+tensorflow<=1.4.0
